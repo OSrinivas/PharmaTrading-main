@@ -1,0 +1,364 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.21;
+/*
+  SMaRtPharmaChain: Multi-token & batch trading with dynamic incentives/penalties.
+  - Assets supported: ERC20 / ERC721 / ERC1155 (transferred S->B).
+  - Payments: ERC20 escrow from Buyer to this contract, then settled to stakeholders.
+  - Scores: Compliance (C), Timeliness (T), Quality (Q), Batch efficiency (B_), Violations (V).
+  - Thresholds: if C < Cmin OR Q < Qmin => NetPayment = 0 (reject).
+  - Factor clamp: [0, PiMax].
+  - Payout split: Manufacturer, Distributor, Transporter, Pharmacist (configurable).
+*/
+
+/// -------- Minimal interfaces (Remix-friendly, no external imports) --------
+interface IERC20 {
+    function transfer(address to, uint256 value) external returns (bool);
+    function transferFrom(address src, address dst, uint256 value) external returns (bool);
+    function approve(address spender, uint256 value) external returns (bool);
+    function allowance(address src, address spender) external view returns (uint256);
+    function balanceOf(address a) external view returns (uint256);
+    function decimals() external view returns (uint8);
+}
+interface IERC721 {
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+}
+
+interface IERC1155 {
+    function safeBatchTransferFrom(
+        address from, address to, uint256[] calldata ids, uint256[] calldata amounts, bytes calldata data
+    ) external;
+}
+
+/// Optional oracles (use if available; otherwise owner can set scores directly)
+interface IScoreOracle {
+    // return scores in 1e4 fixed-point (e.g., 0.9531 => 9531)
+    function compliance(bytes32 batchId) external view returns (uint16); // 0..10000
+    function quality(bytes32 batchId)    external view returns (uint16); // 0..10000
+    function timeliness(bytes32 batchId) external view returns (uint16); // 0..10000
+}
+
+/// -------- Access control / utils (tiny, no OZ) --------
+contract Ownable {
+    address public owner;
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    constructor() { owner = msg.sender; emit OwnershipTransferred(address(0), msg.sender); }
+    modifier onlyOwner() { require(msg.sender == owner, "not owner"); _; }
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "0 addr"); emit OwnershipTransferred(owner, newOwner); owner = newOwner;
+    }
+}
+
+contract ReentrancyGuard {
+    uint256 private _g = 1;
+    modifier nonReentrant() {
+        require(_g == 1, "reentrancy"); _g = 2; _; _g = 1;
+    }
+}
+
+/// -------- Core contracts --------
+contract SmartIncentivesPenalties is Ownable {
+    // weights in 1e4 fixed-point (e.g., 0.25 => 2500)
+    struct Weights {
+        uint16 a; uint16 b; uint16 c; uint16 d; // incentives
+        uint16 e; uint16 f; uint16 g; uint16 h; // penalties
+    }
+
+    // thresholds (scores in 1e4 fixed-point)
+    uint16 public Cmin = 5000; // 0.5
+    uint16 public Qmin = 6000; // 0.6
+    uint16 public PiMax = 20000; // 2.0 in 1e4
+    Weights public W = Weights({
+        a:1500, b:2000, c:2500, d:1000,
+        e:1000, f:1500, g:2500, h:2000
+    });
+
+    event ThresholdsUpdated(uint16 Cmin, uint16 Qmin, uint16 PiMax);
+    event WeightsUpdated(Weights W);
+
+    function setThresholds(uint16 _Cmin, uint16 _Qmin, uint16 _PiMax) external onlyOwner {
+        require(_Cmin <= 10000 && _Qmin <= 10000 && _PiMax >= 0, "bad thresholds");
+        Cmin = _Cmin; Qmin = _Qmin; PiMax = _PiMax;
+        emit ThresholdsUpdated(Cmin, Qmin, PiMax);
+    }
+    function setWeights(Weights calldata w) external onlyOwner {
+        W = w; emit WeightsUpdated(W);
+    }
+
+    /// Calculate NetPayment using fixed-point scores and weights (1e4).
+    /// P0: price per unit (in smallest unit of payment token), qb: quantity (units)
+    /// Returns (factor1e4, netPaymentAmount).
+    function computeNetPayment(
+        uint256 P0, uint256 qb,
+        uint16 C, uint16 T, uint16 Q, uint16 B_, uint16 V
+    ) public view returns (uint16 factor1e4, uint256 netPayment) {
+
+        // Thresholds
+        if (C < Cmin || Q < Qmin) {
+            return (0, 0);
+        }
+
+        // incentives = a*C + b*T + c*Q + d*B
+        uint256 incentives = uint256(W.a) * C + uint256(W.b) * T + uint256(W.c) * Q + uint256(W.d) * B_;
+        // penalties = e*(1-C) + f*(1-T) + g*(1-Q) + h*V; (all in 1e4 space)
+        uint256 one = 10000;
+        uint256 penalties = uint256(W.e) * (one - C) + uint256(W.f) * (one - T) + uint256(W.g) * (one - Q)+ uint256(W.h) * V;
+        // Convert to 1e4 domain: incentives and penalties currently "weights * scores" (1e4*1e4)
+        // We need sum / 1e4 to get back to 1e4 scaling.
+        uint256 inc1e4 = incentives / 10000;
+        uint256 pen1e4 = penalties / 10000;
+
+        // factor = 1 + inc - pen  => in 1e4: 10000 + inc1e4 - pen1e4
+        int256 f = int256(int(10000 + inc1e4)) - int256(int(pen1e4));
+        if (f < 0) f = 0;
+        if (uint256(int256(f)) > PiMax) f = int256(uint256(PiMax));
+        factor1e4 = uint16(uint256(int256(f)));
+
+        // net = P0 * qb * factor
+        netPayment = (P0 * qb * uint256(factor1e4)) / 10000;
+    }
+}
+
+contract SmartPharmaTrading is ReentrancyGuard, Ownable {
+    enum TokenType { ERC20T, ERC721T, ERC1155T }
+    enum Status { Registered, Verified, Ordered, InTransit, Delivered, Settled, Rejected }
+
+    struct Stakeholders {
+        address manufacturer;
+        address distributor;
+        address transporter;
+        address pharmacist;
+        // shares in basis points (10000 = 100%). Must sum to 10000.
+        uint16 shareM;
+        uint16 shareD;
+        uint16 shareT;
+        uint16 shareP;
+    }
+
+    struct Batch {
+        bytes32 id;
+        address seller;
+        address buyer;
+        address paymentToken; // ERC20 used for payment
+        uint256 P0;           // price per unit (payment token decimals)
+        uint256 qb;           // quantity (units)
+        TokenType tokenType;  // asset type being traded
+        address asset;        // ERC20 / ERC721 / ERC1155 address
+        // For ERC20 assets
+        uint256 erc20Amount;  // amount of ERC20 asset to transfer (if ERC20T)
+        // For ERC721 assets
+        uint256[] erc721Ids;
+        // For ERC1155 assets
+        uint256[] erc1155Ids;
+        uint256[] erc1155Amts;
+
+        // Scores (1e4 fixed): can be set by oracle or owner
+        uint16 C; uint16 T; uint16 Q; uint16 B_; uint16 V;
+
+        Status status;
+        Stakeholders stakeholders;
+    }
+
+    SmartIncentivesPenalties public sip;
+    IScoreOracle public oracle; // optional
+    mapping(bytes32 => Batch) public batches;
+
+    event BatchRegistered(bytes32 indexed id, address indexed seller, TokenType tokenType);
+    event BatchVerified(bytes32 indexed id);
+    event OrderInitiated(bytes32 indexed id, address indexed buyer, uint256 escrowed);
+    event DeliveryFinalized(bytes32 indexed id);
+    event BatchSettled(bytes32 indexed id, uint16 factor1e4, uint256 netPaid);
+    event BatchRejected(bytes32 indexed id);
+
+    constructor(address _sip) {
+        require(_sip != address(0), "sip=0");
+        sip = SmartIncentivesPenalties(_sip);
+    }
+
+    function setOracle(address _oracle) external onlyOwner { oracle = IScoreOracle(_oracle); }
+
+    /// Register batch & metadata. Seller = msg.sender.
+    function registerBatch(
+        bytes32 id,
+        address paymentToken,
+        uint256 P0,
+        uint256 qb,
+        TokenType ttype,
+        address asset,
+        uint256 erc20Amount,
+        uint256[] calldata erc721Ids,
+        uint256[] calldata erc1155Ids,
+        uint256[] calldata erc1155Amts,
+        Stakeholders calldata s
+    ) external {
+        require(batches[id].seller == address(0), "exists");
+        require(paymentToken != address(0) && asset != address(0), "0 addr");
+        require(qb > 0 && P0 > 0, "bad P0/qb");
+        require(
+            (ttype == TokenType.ERC20T && erc20Amount > 0) ||
+            (ttype == TokenType.ERC721T && erc721Ids.length > 0) ||
+            (ttype == TokenType.ERC1155T && erc1155Ids.length == erc1155Amts.length && erc1155Ids.length > 0),
+            "bad asset"
+        );
+        require(uint256(s.shareM) + s.shareD + s.shareT + s.shareP == 10000, "shares!=100%");
+
+        batches[id] = Batch({
+            id: id,
+            seller: msg.sender,
+            buyer: address(0),
+            paymentToken: paymentToken,
+            P0: P0,
+            qb: qb,
+            tokenType: ttype,
+            asset: asset,
+            erc20Amount: erc20Amount,
+            erc721Ids: erc721Ids,
+            erc1155Ids: erc1155Ids,
+            erc1155Amts: erc1155Amts,
+            C: 0, T: 0, Q: 0, B_: 0, V: 0,
+            status: Status.Registered,
+            stakeholders: s
+        });
+
+        emit BatchRegistered(id, msg.sender, ttype);
+    }
+
+    /// Optional: pull scores from oracle
+    function pullScores(bytes32 id) external {
+        require(address(oracle) != address(0), "no oracle");
+        Batch storage b = batches[id];
+        require(b.seller != address(0), "no batch");
+        b.C = oracle.compliance(id);
+        b.Q = oracle.quality(id);
+        b.T = oracle.timeliness(id);
+    }
+
+    /// Owner (or authorized role) can set/adjust scores. Values are 0..10000 (1e4 fixed).
+    function setScores(bytes32 id, uint16 C, uint16 T, uint16 Q, uint16 B_, uint16 V) external onlyOwner {
+        Batch storage b = batches[id];
+        require(b.seller != address(0), "no batch");
+        b.C = C; b.T = T; b.Q = Q; b.B_ = B_; b.V = V;
+    }
+
+    /// Verify batch against thresholds (Cmin, Qmin). If fails, mark Rejected.
+    function verifyBatch(bytes32 id) external {
+        Batch storage b = batches[id];
+        require(b.seller != address(0), "no batch");
+        require(b.status == Status.Registered, "bad status");
+        // soft verification; final decision also in settlement by SIP
+        if (b.C < sip.Cmin() || b.Q < sip.Qmin()) {
+            b.status = Status.Rejected;
+            emit BatchRejected(id);
+        } else {
+            b.status = Status.Verified;
+            emit BatchVerified(id);
+        }
+    }
+
+    /// Buyer initiates order: escrow P0 * qb * PiMax/1e4 (upper bound) to guarantee funds.
+    function initiateOrder(bytes32 id, address buyer) external nonReentrant {
+        Batch storage b = batches[id];
+        require(b.status == Status.Verified, "not verified");
+        require(buyer != address(0), "buyer 0");
+        b.buyer = buyer;
+
+        uint256 maxFactor = uint256(sip.PiMax()); // 1e4
+        uint256 escrowAmount = (b.P0 * b.qb * maxFactor) / 10000;
+
+        IERC20 pay = IERC20(b.paymentToken);
+        require(pay.transferFrom(buyer, address(this), escrowAmount), "escrow fail");
+
+        b.status = Status.Ordered;
+        emit OrderInitiated(id, buyer, escrowAmount);
+    }
+
+    /// Seller marks in-transit -> delivered and transfers the asset to Buyer.
+    function transferAsset(bytes32 id) external nonReentrant {
+        Batch storage b = batches[id];
+        require(msg.sender == b.seller, "not seller");
+        require(b.status == Status.Ordered || b.status == Status.InTransit, "bad status");
+        b.status = Status.InTransit;
+
+        if (b.tokenType == TokenType.ERC20T) {
+            require(IERC20(b.asset).transferFrom(b.seller, b.buyer, b.erc20Amount), "erc20 xfer fail");
+        } else if (b.tokenType == TokenType.ERC721T) {
+            for (uint256 i = 0; i < b.erc721Ids.length; i++) {
+                IERC721(b.asset).safeTransferFrom(b.seller, b.buyer, b.erc721Ids[i]);
+            }
+        } else {
+            IERC1155(b.asset).safeBatchTransferFrom(
+                b.seller, b.buyer, b.erc1155Ids, b.erc1155Amts, ""
+            );
+        }
+
+        b.status = Status.Delivered;
+        emit DeliveryFinalized(id);
+    }
+
+    /// Settle payment using SIP formula; refunds any excess escrow to buyer; distributes net.
+    function settle(bytes32 id) external nonReentrant {
+        Batch storage b = batches[id];
+        require(b.status == Status.Delivered || b.status == Status.Verified || b.status == Status.Ordered, "bad status");
+        IERC20 pay = IERC20(b.paymentToken);
+
+        // Compute net
+        (uint16 factor1e4, uint256 net) = sip.computeNetPayment(
+            b.P0, b.qb, b.C, b.T, b.Q, b.B_, b.V
+        );
+
+        // Compute escrowed max used in initiateOrder
+        uint256 maxFactor = uint256(sip.PiMax());
+        uint256 escrowAmount = (b.P0 * b.qb * maxFactor) / 10000;
+
+        // Contract must hold at least escrowAmount (locked earlier)
+        require(pay.balanceOf(address(this)) >= escrowAmount, "escrow missing");
+
+        // If rejected => net=0, full refund
+        if (net == 0) {
+            require(pay.transfer(b.buyer, escrowAmount), "refund fail");
+            b.status = Status.Rejected;
+            emit BatchRejected(id);
+            return;
+        }
+
+        // Pay stakeholders from escrow: send 'net' to stakeholders, refund remainder to buyer
+        uint256 refund = escrowAmount - net;
+
+        // Stakeholder splits (basis points)
+        Stakeholders memory s = b.stakeholders;
+        require(
+            uint256(s.shareM) + s.shareD + s.shareT + s.shareP == 10000,
+            "shares!=100%"
+        );
+
+        // Distribute
+        if (net > 0) {
+            uint256 mAmt = (net * s.shareM) / 10000;
+            uint256 dAmt = (net * s.shareD) / 10000;
+            uint256 tAmt = (net * s.shareT) / 10000;
+            uint256 pAmt = net - mAmt - dAmt - tAmt; // remainder
+
+            require(pay.transfer(s.manufacturer, mAmt), "m xfer fail");
+            require(pay.transfer(s.distributor, dAmt), "d xfer fail");
+            require(pay.transfer(s.transporter, tAmt), "t xfer fail");
+            require(pay.transfer(s.pharmacist, pAmt), "p xfer fail");
+        }
+
+        // Refund any extra escrow to buyer
+        if (refund > 0) {
+            require(pay.transfer(b.buyer, refund), "refund fail");
+        }
+
+        b.status = Status.Settled;
+        emit BatchSettled(id, factor1e4, net);
+    }
+}
+
+ 
+ 
+ 
+ 
+ 
+ 
+  
+
+

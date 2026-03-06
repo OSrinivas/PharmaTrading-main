@@ -1,2 +1,2 @@
 # PharmaTrading-main
-P2P Pharma Trading and Supply, Incentives
+SMaRtPharmaChain, trading, supply chain Incentives
