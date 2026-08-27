@@ -356,7 +356,7 @@ const handlePharmaDataChange = (index, field, value) => {
       
       <div className={`p-4 rounded-xl shadow-md  mx-auto space-y-6 w-fit bg-white border border-black/50 " `}>
         {!haveResult &&(< >
-                  <h2 className="text-2xl font-semibold text-center ">SMART-PHARMA TRADING & SUPPLY</h2>
+                  <h2 className="text-2xl font-semibold text-center "> B-TRADE & SUPPLY</h2>
         {/*m For*/}
         <div className="w-p">
           <div className="flex-1 border border-black/50 rounded-xl p-4 w-fit">
@@ -469,7 +469,7 @@ const handlePharmaDataChange = (index, field, value) => {
           <>
 
             <h2 className="text-xl font-bold mb-4 text-black text-center">
-            SMART-PHARMA TRADING & SUPPLY - Payment Settlement
+            PHRAMA B-TRADE & SUPPLY - Payment Settlement
             </h2>
 
             <div className={`text-center mb-4  text-xl `}>
